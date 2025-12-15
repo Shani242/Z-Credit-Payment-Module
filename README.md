@@ -48,7 +48,7 @@ The module is configured to communicate with the following live Z-Credit Sandbox
 | :--- | :--- |
 | **CommitFullTransaction** | `https://pci.zcredit.co.il/ZCreditWS/api/Transaction/CommitFullTransaction` |
 
-### Critical Logic (The Success Fix)
+### Critical Logic 
 
 The module uses a highly reliable method for determining success, based on the specific JSON structure returned by the Z-Credit API:
 
@@ -67,7 +67,7 @@ Any deviation from this combined logic results in the transaction being marked a
 | Category | Key Features |
 | :--- | :--- |
 | **Form & UX** | Masked password/CVV fields, clear status bar (`draft`, `processing`, `success`, `failed`), detailed transaction history, Chatter for auditing.  |
-| **Validation (Bonus)** | Strict field validation (`@api.constrains`) to prevent bad data from reaching the API (e.g., Expired Card check, positive Amount check, format checking). |
+| **Validation** | Strict field validation (`@api.constrains`) to prevent bad data from reaching the API (e.g., Expired Card check, positive Amount check, format checking). |
 | **API Integration** | Direct call to live Z-Credit endpoint, correct JSON payload construction (`password` as key, `ExpDate_MMYY` format), timeout protection (45s). |
 | **Error Handling** | Comprehensive `try/except` for network errors (`Timeout`, `ConnectionError`) and application errors (`JSONDecodeError`), displaying Z-Credit's specific `ReturnCode` on failure. |
 | **Transaction Types** | Supports **Sale** (`J=0`) and **Authorize** (`J=5`) via the `J` parameter mapping. |
@@ -105,29 +105,7 @@ These scenarios test both the Odoo validation layer and the live API communicati
 
 -----
 
-## 6\. Implementation Details
-
-### A. Python (`zcredit_transaction.py`)
-
-  * **API\_URL:** Fixed to the official `CommitFullTransaction` endpoint.
-  * **Payload Fix:** The problematic field `TransactionType` was removed from the payload, as the `J` parameter handles the logic, preventing the "Salete" input error.
-  * **`@api.constrains`:** Extensive field-level validation is implemented (e.g., CVV format, Expiry Date check using `datetime.date.today()`).
-  * **Response Handling (`_handle_api_response`):** Success logic is based on: `(HTTP 200) AND (HasError is False) AND (ReturnCode == 0)`.
-  * **Security:** `terminal_password` is correctly passed in the payload as `password` (API parameter name).
-
-### B. XML (`zcredit_transaction_views.xml`)
-
-  * **Views:** Defines a clear **Form View**  for data entry and a **List View** for history.
-  * **UI:** Uses `password="True"` for masking sensitive fields (`terminal_password`, `cvv`).
-  * **Menu:** Creates **Z-Credit** menu items under **Accounting** (`account.menu_finance`).
-
-### C. Security (`ir.model.access.csv`)
-
-  * The access file grants standard CRUD (Create, Read, Update, Delete) permissions for the `zcredit.transaction` model to the basic Odoo user group (`base.group_user`).
-
------
-
-## 7\. Module Structure
+## 6\. Module Structure
 
 The module adheres to standard Odoo directory conventions:
 
