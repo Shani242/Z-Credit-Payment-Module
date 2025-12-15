@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- Form View -->
+        <record id="view_zcredit_transaction_form" model="ir.ui.view">
+            <field name="name">zcredit.transaction.form</field>
+            <field name="model">zcredit.transaction</field>
+            <field name="arch" type="xml">
+                <form>
+                    <header>
+                        <button name="action_test_transaction" type="object" string="Test Transaction" class="btn-primary"/>
+                        <field name="status" widget="statusbar" options="{'clickable': False}"/>
+                    </header>
+                    <sheet>
+                        <h1><field name="name"/></h1>
+                        <group>
+                            <group string="Terminal Configuration">
+                                <field name="terminal_number"/>
+                                <field name="terminal_password" password="True"/>
+                            </group>
+                            <group string="Transaction Details">
+                                <field name="amount"/>
+                                <field name="transaction_type"/>
+                            </group>
+                        </group>
+                        <group string="Card Details">
+                            <field name="card_number"/>
+                            <field name="expiry_date"/>
+                            <field name="cvv" password="True"/>
+                            <field name="cardholder_name"/>
+                        </group>
+                        <group string="API Response">
+                            <field name="result" nolabel="1" readonly="1"/>
+                        </group>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- List View -->
+        <record id="view_zcredit_transaction_list" model="ir.ui.view">
+            <field name="name">zcredit.transaction.list</field>
+            <field name="model">zcredit.transaction</field>
+            <field name="arch" type="xml">
+                <list>
+                    <field name="name"/>
+                    <field name="cardholder_name"/>
+                    <field name="amount"/>
+                    <field name="transaction_type"/>
+                    <field name="status"/>
+                </list>
+            </field>
+        </record>
+
+        <!-- Action -->
+        <record id="action_zcredit_transaction" model="ir.actions.act_window">
+            <field name="name">Z-Credit Transactions</field>
+            <field name="res_model">zcredit.transaction</field>
+            <field name="view_mode">list,form</field>
+            <field name="help">Test Z-Credit payment gateway integration</field>
+        </record>
+
+        <!-- Menu Items -->
+        <menuitem id="menu_zcredit_root" name="Z-Credit" parent="account.menu_finance" sequence="100"/>
+        <menuitem id="menu_zcredit_transactions" name="Transactions" parent="menu_zcredit_root" action="action_zcredit_transaction" sequence="10"/>
+    </data>
+</odoo>
