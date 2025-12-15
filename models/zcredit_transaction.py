@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-from odoo import models, fields, api
-from odoo.exceptions import ValidationError
-from datetime import datetime
-import re
-import requests
 import json
 import logging
+import re
+from odoo import models, fields, api, _
+from odoo.exceptions import ValidationError
+import requests
+from requests.exceptions import Timeout, ConnectionError, RequestException
+from datetime import date
 
 _logger = logging.getLogger(__name__)
 
@@ -13,332 +14,209 @@ _logger = logging.getLogger(__name__)
 class ZCreditTransaction(models.Model):
     _name = 'zcredit.transaction'
     _description = 'Z-Credit Payment Test'
+    _inherit = ['mail.thread', 'mail.activity.mixin']
 
-    # Required Fields
-    name = fields.Char('Reference', default='New', readonly=True)
+    # API Configuration
+    API_URL = 'https://pci.zcredit.co.il/ZCreditWS/api/Transaction/CommitFullTransaction'
 
-    terminal_number = fields.Char('Terminal Number', required=True)
-    terminal_password = fields.Char('Terminal Password', required=True)
+    # Fields
+    name = fields.Char('Reference', default=lambda self: _('New'), readonly=True, copy=False)
 
-    card_number = fields.Char('Card Number', required=True)
+    # Terminal Configuration
+    terminal_number = fields.Char('Terminal Number', required=True, tracking=True)
+    terminal_password = fields.Char('Terminal Password', required=True, tracking=True)
+
+    # Card Details
+    card_number = fields.Char('Credit Card Number', required=True)
     expiry_date = fields.Char('Expiry (MM/YY)', required=True, help="Format: MM/YY")
     cvv = fields.Char('CVV', required=True)
     cardholder_name = fields.Char('Cardholder Name', required=True)
 
-    amount = fields.Float('Amount', required=True)
+    # Transaction Details
+    amount = fields.Float('Amount', required=True, tracking=True)
     transaction_type = fields.Selection([
         ('sale', 'Sale'),
-        ('authorize', 'Authorize'),
+        ('authorize', 'Authorize (J5)'),
         ('refund', 'Refund'),
-    ], string='Transaction Type', default='sale', required=True)
+    ], string='Transaction Type', default='sale', required=True, tracking=True)
 
-    result = fields.Text('API Response', readonly=True)
+    # Results
+    result = fields.Text('API Response', readonly=True, copy=False)
     status = fields.Selection([
         ('draft', 'Draft'),
+        ('processing', 'Processing'),
         ('success', 'Success'),
         ('failed', 'Failed'),
-        ('pending', 'Pending'),  # For timeout scenarios
-    ], string='Status', default='draft', readonly=True)
+    ], string='Status', default='draft', required=True, tracking=True, copy=False)
 
+    # Odoo Overrides and Sequence
     @api.model_create_multi
     def create(self, vals_list):
-        """Generate unique Reference ID on creation"""
         for vals in vals_list:
-            if vals.get('name', 'New') == 'New':
-                # Generate unique ID
-                seq = self.env['ir.sequence'].next_by_code('zcredit.transaction')
-                vals['name'] = seq or f'TRX-{self.env.uid}-{fields.Datetime.now().timestamp()}'
+            if vals.get('name', _('New')) == _('New'):
+                vals['name'] = self.env['ir.sequence'].next_by_code('zcredit.transaction') or _('New')
         return super().create(vals_list)
 
-    # ========== VALIDATION CONSTRAINTS ==========
-
+    # Validation (@api.constrains)
     @api.constrains('amount')
     def _check_amount(self):
         """Validate amount is positive"""
         for record in self:
             if record.amount <= 0:
-                raise ValidationError("Amount must be a positive number.")
-            if record.amount > 999999.99:
-                raise ValidationError("Amount exceeds maximum allowed limit.")
+                raise ValidationError(_("Transaction amount must be a positive number."))
 
     @api.constrains('card_number')
     def _check_card_number(self):
-        """Validate card number format (Luhn algorithm)"""
+        """Validate card number format """
         for record in self:
-            card = record.card_number.replace(' ', '')
-
-            # Check length
-            if not (13 <= len(card) <= 19):
-                raise ValidationError("Card number must be between 13-19 digits.")
-
-            # Check if only digits
-            if not card.isdigit():
-                raise ValidationError("Card number must contain only digits.")
+            if not re.fullmatch(r'\d{13,19}', record.card_number.replace(' ', '')):
+                raise ValidationError(_("Invalid Card Number format. Must be 13-19 digits."))
 
     @api.constrains('expiry_date')
     def _check_expiry_date(self):
         """Validate expiry date format and if not expired"""
         for record in self:
-            expiry = record.expiry_date.strip()
+            if not re.fullmatch(r'\d{2}/\d{2}', record.expiry_date):
+                raise ValidationError(_("Invalid Expiry Date format. Must be MM/YY."))
 
-            # Check format MM/YY
-            if not re.match(r'^\d{2}/\d{2}$', expiry):
-                raise ValidationError("Expiry date must be in MM/YY format (e.g., 12/25).")
-
-            # Parse month and year
             try:
-                month, year = expiry.split('/')
-                month = int(month)
-                year = int(year)
+                month_str, year_str = record.expiry_date.split('/')
+                current_century = date.today().year // 100 * 100
+                expiry_year = current_century + int(year_str)
+                expiry_month = int(month_str)
 
-                # Validate month
-                if not (1 <= month <= 12):
-                    raise ValidationError("Month must be between 01 and 12.")
+                if not (1 <= expiry_month <= 12):
+                    raise ValidationError(_("Invalid Expiry Month (must be 01-12)."))
 
-                # Check if card is expired (assuming 20YY format)
-                current_year = datetime.now().year
-                current_month = datetime.now().month
+                today = date.today()
 
-                # Convert YY to YYYY (assuming 20YY)
-                full_year = 2000 + year
+                if expiry_year < today.year or (expiry_year == today.year and expiry_month < today.month):
+                    raise ValidationError(_("Card is expired."))
 
-                # Card expires at the end of the month
-                if full_year < current_year or (full_year == current_year and month < current_month):
-                    raise ValidationError(f"Card has expired. Expiry date: {expiry}")
-
-            except (ValueError, IndexError):
-                raise ValidationError("Invalid expiry date format.")
+            except ValueError:
+                raise ValidationError(_("Invalid Expiry Date format."))
 
     @api.constrains('cvv')
     def _check_cvv(self):
         """Validate CVV format"""
         for record in self:
-            cvv = record.cvv.strip()
+            if not re.fullmatch(r'\d{3,4}', record.cvv):
+                raise ValidationError(_("Invalid CVV. Must be 3 or 4 digits."))
 
-            # CVV should be 3-4 digits
-            if not re.match(r'^\d{3,4}$', cvv):
-                raise ValidationError("CVV must be 3 or 4 digits.")
+    # Helper Methods for API Response Handling
 
-    @api.constrains('cardholder_name')
-    def _check_cardholder_name(self):
-        """Validate cardholder name"""
-        for record in self:
-            name = record.cardholder_name.strip()
-
-            # Check if empty
-            if not name:
-                raise ValidationError("Cardholder name is required.")
-
-            # Check length
-            if len(name) < 3:
-                raise ValidationError("Cardholder name must be at least 3 characters.")
-
-            if len(name) > 100:
-                raise ValidationError("Cardholder name must not exceed 100 characters.")
-
-            # Check for valid characters (letters, spaces, hyphens, dots)
-            if not re.match(r"^[a-zA-Z\s\-\.]*$", name):
-                raise ValidationError(
-                    "Cardholder name contains invalid characters. "
-                    "Only letters, spaces, hyphens, and dots are allowed."
-                )
-
-    # ========== EDGE CASE HANDLERS ==========
-
-    def _check_duplicate_transaction(self):
-        """Check if this transaction was already processed (Duplicate Prevention)"""
-        existing = self.search([
-            ('name', '=', self.name),
-            ('status', '!=', 'draft'),
-            ('id', '!=', self.id),
-        ])
-
-        if existing:
-            raise ValidationError(
-                f"Transaction {self.name} was already processed. "
-                "Duplicate transactions are not allowed."
-            )
-
-    def _simulate_card_validation(self):
-        """Simulate card validation scenarios"""
-        # Stolen/Lost card simulation
-        stolen_cards = ['4532015112830366', '5425233010103442']
-        if self.card_number in stolen_cards:
-            return {
-                'Success': False,
-                'Code': '205',
-                'Message': 'Card Declined - Do Not Honor (Card is reported stolen/lost)'
+    def _return_notification(self, message, type='success'):
+        """Helper to create an Odoo notification dictionary."""
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'message': message,
+                'type': type,
+                'sticky': type in ('danger', 'warning'),
             }
+        }
 
-        # Credit limit simulation
-        if self.amount > 5000:
-            return {
-                'Success': False,
-                'Code': '206',
-                'Message': 'Insufficient Funds - Amount exceeds credit limit'
-            }
-
-        # Restricted transaction type
-        if self.transaction_type == 'refund' and self.amount > 1000:
-            return {
-                'Success': False,
-                'Code': '207',
-                'Message': 'Transaction Not Allowed - Refund limit exceeded'
-            }
-
-        return None
-
-    # ========== MAIN ACTION ==========
-
-    def action_test_transaction(self):
-        """Test transaction with Z-Credit API (Mock Implementation)"""
+    def _handle_api_response(self, response_text, http_status_code):
+        """
+        Processes the API response text and updates the record.
+        """
         self.ensure_one()
-
-        try:
-            # Check for duplicate transactions
-            self._check_duplicate_transaction()
-
-            # ========== VALIDATION PHASE ==========
-            if not self.terminal_number or not self.terminal_password:
-                return self._return_error(
-                    'Missing Required Fields',
-                    'Terminal number and password are required.'
-                )
-
-            if not self.cardholder_name:
-                return self._return_error(
-                    'Missing Required Fields',
-                    'Cardholder name is required.'
-                )
-
-            # ========== BUSINESS LOGIC PHASE ==========
-
-            # Check for known card issues
-            card_error = self._simulate_card_validation()
-            if card_error:
-                return self._handle_api_response(card_error, 400)
-
-            TERMINAL_OK = (self.terminal_number == '0882016016' and
-                           self.terminal_password == 'Z0882016016')
-
-            # Invalid card format
-            if len(self.card_number) < 15:
-                api_result = {
-                    'Success': False,
-                    'Code': '106',
-                    'Message': 'Invalid Card Format'
-                }
-                return self._handle_api_response(api_result, 400)
-
-            # Authentication failed
-            elif not TERMINAL_OK:
-                api_result = {
-                    'Success': False,
-                    'Code': '101',
-                    'Message': 'Authentication Failed: Invalid Terminal ID or Password'
-                }
-                return self._handle_api_response(api_result, 401)
-
-            # Amount validation
-            elif self.amount <= 0:
-                api_result = {
-                    'Success': False,
-                    'Code': '102',
-                    'Message': 'Invalid Amount'
-                }
-                return self._handle_api_response(api_result, 400)
-
-            # Successful transaction
-            else:
-                api_result = {
-                    'Success': True,
-                    'Code': '000',
-                    'Message': 'Transaction Approved',
-                    'ZCreditID': f'TRX-{self.name}',
-                    'Amount': self.amount,
-                    'Type': self.transaction_type.upper(),
-                    'Timestamp': fields.Datetime.now()
-                }
-                return self._handle_api_response(api_result, 200)
-
-        except ValidationError as e:
-            # Validation error from constraints
-            return self._return_error('Validation Error', str(e))
-
-        except requests.exceptions.Timeout:
-            # Network timeout - Transaction status unknown
-            return self._return_error(
-                'API Request Timeout',
-                'Server did not respond in time. Transaction status is pending.',
-                status='pending'
-            )
-
-        except requests.exceptions.ConnectionError:
-            return self._return_error(
-                'Connection Error',
-                'Cannot reach API server. Please check your internet connection.'
-            )
-
-        except requests.exceptions.RequestException as e:
-            return self._return_error(
-                'Request Error',
-                f'An error occurred during the request: {str(e)}'
-            )
-
-        except json.JSONDecodeError:
-            return self._return_error(
-                'Invalid API Response',
-                'Server returned invalid JSON. Please contact support.'
-            )
-
-        except Exception as e:
-            _logger.error(f"Unexpected error in transaction: {str(e)}", exc_info=True)
-            return self._return_error(
-                'Unexpected Error',
-                f'An unexpected error occurred: {str(e)}'
-            )
-
-    # ========== HELPER METHODS ==========
-
-    def _handle_api_response(self, api_result, status_code):
-        """Handle API response and update transaction"""
-        response_text = json.dumps(api_result, indent=2, default=str)
         self.result = response_text
 
-        if api_result.get('Success') and status_code in [200, 201]:
-            self.status = 'success'
-            return self._return_success(api_result.get('Message', 'Transaction approved'))
-        else:
+        try:
+            response_json = json.loads(response_text)
+            self.result = json.dumps(response_json, indent=2, ensure_ascii=False)
+
+            # ---  Z-Credit ---
+            has_error = response_json.get('HasError', True)
+            return_code = response_json.get('ReturnCode')
+            return_message = response_json.get('ReturnMessage')
+
+            is_successful = (http_status_code == 200) and (has_error is False) and (return_code == 0)
+
+            if is_successful:
+                self.status = 'success'
+                approval_num = response_json.get('ApprovalNumber', '')
+                message = _("Transaction completed successfully! Approval: %s") % approval_num
+                return self._return_notification(message, 'success')
+            else:
+                self.status = 'failed'
+
+                prefix = f"Z-Credit Error ({return_code}): " if return_code is not None else "API Error: "
+                error_message = return_message or _(
+                    "Transaction failed. Check the 'API Response' field for full details.")
+
+                _logger.warning("Z-Credit Transaction Failed: %s | Response: %s", self.name, response_text)
+                return self._return_notification(prefix + error_message, 'danger')
+
+        except json.JSONDecodeError:
             self.status = 'failed'
-            return self._return_error(
-                'Transaction Failed',
-                api_result.get('Message', 'Unknown error occurred')
-            )
+            _logger.error("API returned non-JSON data or invalid JSON: %s", response_text)
+            self.result = _("API returned invalid data: %s") % response_text
+            return self._return_notification(_("API returned invalid data. Check result field."), 'danger')
+        except Exception as e:
+            self.status = 'failed'
+            _logger.error("Error handling Z-Credit response: %s", str(e))
+            self.result += f"\nInternal Parsing Error: {str(e)}"
+            return self._return_notification(_("An unexpected error occurred during response processing."), 'danger')
 
-    def _return_success(self, message):
-        """Return success notification"""
-        return {
-            'type': 'ir.actions.client',
-            'tag': 'display_notification',
-            'params': {
-                'message': f'{message}',
-                'type': 'success',
-                'sticky': False,
-            }
+    # Main Transaction Method
+
+    def action_test_transaction(self):
+        self.ensure_one()
+
+        self.status = 'processing'
+        self.result = _("Sending request to Z-Credit API...")
+
+        j_parameter = 0
+        if self.transaction_type == 'authorize':
+            j_parameter = 5  # J=5 for Authorization (J5)
+
+        expiry_formatted = self.expiry_date.replace('/', '')  # MM/YY -> MMYY
+
+        payload = {
+            # Credentials
+            'TerminalNumber': self.terminal_number,
+            'password': self.terminal_password,
+            # Card Data
+            'CardNumber': self.card_number.replace(' ', ''),
+            'ExpDate_MMYY': expiry_formatted,
+            'CVV': self.cvv,
+            'CardHolderName': self.cardholder_name,
+            # Transaction Data
+            'TransactionSum': self.amount,
+            'J': j_parameter,
         }
 
-    def _return_error(self, title, message, status='failed'):
-        """Return error notification and update status"""
-        self.result = f"{title}: {message}"
-        self.status = status
-        _logger.error(f"{title} - {message}")
+        headers = {'Content-Type': 'application/json'}
 
-        return {
-            'type': 'ir.actions.client',
-            'tag': 'display_notification',
-            'params': {
-                'message': f' {title}: {message}',
-                'type': 'danger',
-                'sticky': True,
-            }
-        }
+        try:
+            _logger.info("Z-Credit API Request for %s: %s", self.name, payload)
+
+            response = requests.post(self.API_URL, headers=headers, json=payload, timeout=45)
+
+            return self._handle_api_response(response.text, response.status_code)
+
+        except Timeout:
+            self.status = 'failed'
+            self.result = _("Request timed out after 45 seconds.")
+            return self._return_notification(_("The API request timed out."), 'danger')
+        except ConnectionError:
+            self.status = 'failed'
+            self.result = _("Connection Error: Could not reach Z-Credit gateway.")
+            return self._return_notification(_("Could not connect to the Z-Credit API endpoint."), 'danger')
+        except RequestException as e:
+            self.status = 'failed'
+            self.result = _("A network error occurred: %s") % str(e)
+            return self._return_notification(_("A general network error occurred."), 'danger')
+        except Exception as e:
+            #  ValidationError
+            if isinstance(e, ValidationError):
+                self.status = 'draft'
+                raise e
+
+            self.status = 'failed'
+            self.result = _("An unexpected internal error occurred: %s") % str(e)
+            _logger.exception("Unexpected error during Z-Credit transaction attempt.")
+            return self._return_notification(_("An unexpected internal system error occurred."), 'danger')
